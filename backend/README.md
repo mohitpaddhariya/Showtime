@@ -80,8 +80,8 @@ Voiceover Audio → Whisper (Groq) → Sentences ──┘   + Refinement Loop
    - **Scene-aware chronological** — pure math fallback
    - **Refinement loop** (max 2 passes) — AI reviews its own mapping, sees pacing warnings, adjusts
    - All strategies enforce chronological order (no backward jumps)
-5. **Timeline** — Sub-segment splitting, gap clips with silence for natural pauses
-6. **Renderer** — Per-clip video+audio sync (play/freeze/gap), fps normalization, ffprobe validation
+5. **Timeline** — Sub-segment splitting (enforces minimum video duration), gap clips with silence for natural pauses
+6. **Renderer** — Per-clip video+audio sync (play/gap), adaptive speed control, and **auto-freeze** for extreme speeds to maintain watchability, fps normalization, ffprobe validation
 
 ### Configuration
 
@@ -95,6 +95,8 @@ Voiceover Audio → Whisper (Groq) → Sentences ──┘   + Refinement Loop
 | `SHOWTIME_SCENE_REFINE_THRESHOLD` | `20.0` | Lower threshold for splitting long segments |
 | `SHOWTIME_MAX_SEGMENT_DURATION` | `10.0` | Auto-split segments longer than this |
 | `SHOWTIME_MIN_SEGMENT_DURATION` | `1.5` | Merge segments shorter than this |
+| `SHOWTIME_MAX_PLAYBACK_SPEED` | `2.5` | Max speed before switching to auto-freeze |
+| `SHOWTIME_MIN_PLAYBACK_SPEED` | `0.5` | Min speed before switching to auto-freeze |
 | `SHOWTIME_OUTPUT_PRESET` | `medium` | FFmpeg preset |
 | `SHOWTIME_CRF` | `23` | Video quality (18-28) |
 | `SHOWTIME_CROSSFADE_DURATION` | `0.3` | Transition duration (0 = hard cut) |

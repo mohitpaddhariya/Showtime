@@ -64,11 +64,35 @@ def _describe_keyframe(keyframe_path: Path | None) -> str:
 
 
 def _ocr_keyframe(keyframe_path: Path) -> str:
-    """Run Tesseract OCR on a keyframe image."""
+    """Run Tesseract OCR on a keyframe image with aggressive noise cleanup."""
     image = Image.open(keyframe_path)
     text = pytesseract.image_to_string(image)
-    cleaned = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-    return cleaned
+
+    # Clean up OCR noise
+    lines = []
+    seen = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Skip lines that are mostly non-alphanumeric (garbage)
+        alnum_count = sum(1 for c in line if c.isalnum() or c.isspace())
+        if len(line) > 0 and alnum_count / len(line) < 0.5:
+            continue
+        # Skip very short lines (likely UI chrome noise)
+        if len(line) < 3:
+            continue
+        # Deduplicate
+        if line.lower() in seen:
+            continue
+        seen.add(line.lower())
+        lines.append(line)
+
+    # Limit to most relevant text (first ~500 chars)
+    result = "\n".join(lines)
+    if len(result) > 500:
+        result = result[:500] + "..."
+    return result
 
 
 def _analyze_structure(keyframe_path: Path) -> str:

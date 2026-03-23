@@ -139,11 +139,12 @@ OCR / Frame Description                   |
 
 - **Input:** AI mapping + original video + audio
 - **Process:**
-  - Build FFmpeg filter graph from the mapping
-  - For each mapping entry:
-    - Extract the screen segment from the video
-    - Adjust playback speed to match voiceover sentence duration
-  - Concatenate all adjusted clips in order
+  - Build edit decision list from mapping
+  - **Timeline:** Allocate video slices to sentences (enforcing a minimum video duration per clip)
+  - **Renderer:** For each mapping entry:
+    - Extract the screen segment and adjust playback speed to match voiceover duration
+    - If speed exceeds max threshold (2.5x), **auto-freeze** on a keyframe to prevent choppy unwatchable playback
+  - Concatenate all adjusted clips sequentially
   - Overlay the voiceover audio track
   - Render to MP4 (H.264 + AAC)
 - **Output:** Final polished video file

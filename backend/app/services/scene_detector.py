@@ -89,15 +89,33 @@ def _find_scene_boundaries(
 ) -> list[int]:
     """Return indices into `frames` where scene changes occur.
 
-    A scene change is detected when the mean absolute pixel difference
-    between consecutive sampled frames exceeds `settings.scene_threshold`.
+    Uses two complementary methods:
+    1. Mean absolute pixel difference (catches structural changes)
+    2. Histogram comparison (catches color/layout changes that pixel diff misses)
+
+    A scene change is detected if EITHER method exceeds its threshold.
     """
     boundaries: list[int] = [0]  # first frame always starts a scene
 
     for i in range(1, len(frames)):
+        # Method 1: pixel diff
         diff = cv2.absdiff(frames[i][1], frames[i - 1][1])
         mean_diff = float(np.mean(diff))
-        if mean_diff > settings.scene_threshold:
+
+        # Method 2: histogram comparison (catches page navigations, color changes)
+        # Only triggers if there's also a meaningful pixel diff (> half the threshold)
+        # This prevents histogram from overriding intentionally high thresholds
+        hist_change = False
+        if mean_diff > settings.scene_threshold * 0.5:
+            hist_prev = cv2.calcHist([frames[i - 1][1]], [0], None, [64], [0, 256])
+            hist_curr = cv2.calcHist([frames[i][1]], [0], None, [64], [0, 256])
+            cv2.normalize(hist_prev, hist_prev)
+            cv2.normalize(hist_curr, hist_curr)
+            hist_corr = cv2.compareHist(hist_prev, hist_curr, cv2.HISTCMP_CORREL)
+            # correlation < 0.85 means significant histogram shift
+            hist_change = hist_corr < 0.85
+
+        if mean_diff > settings.scene_threshold or hist_change:
             boundaries.append(i)
 
     return boundaries

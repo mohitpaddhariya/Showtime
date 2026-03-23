@@ -21,8 +21,12 @@ from app.models.domain import Timeline, TimelineClip
 
 logger = logging.getLogger(__name__)
 
+# Fallback constants (used when settings not available, e.g. build_ffmpeg_clip_args)
 _MIN_SPEED = 0.5
-_MAX_SPEED = 3.0
+_MAX_SPEED = 2.5
+
+# Speed above which we auto-freeze instead of playing choppy fast-forward
+_AUTO_FREEZE_THRESHOLD = 2.5
 
 
 def render(
@@ -54,7 +58,7 @@ def render(
             clip_path = work_dir / f"clip_{clip.order:04d}.mp4"
             if clip.is_gap:
                 _render_gap_clip(clip, timeline, clip_path, src_props, settings)
-            elif clip.freeze:
+            elif clip.freeze or _should_auto_freeze(clip, settings):
                 _render_freeze_clip(clip, timeline, clip_path, src_props, settings)
             else:
                 _render_content_clip(clip, timeline, clip_path, src_props, settings)
@@ -74,6 +78,21 @@ def render(
     return output_path
 
 
+def _should_auto_freeze(clip: TimelineClip, settings: Settings) -> bool:
+    """Auto-freeze clips that would need extreme speed-up.
+
+    When video-to-audio ratio exceeds the max speed threshold, the result
+    is unwatchably choppy. Better to hold a keyframe still (freeze) so the
+    viewer can read the screen while listening.
+    """
+    video_duration = clip.source_end - clip.source_start
+    audio_duration = clip.rendered_duration
+    if audio_duration <= 0 or video_duration <= 0:
+        return False
+    effective_speed = video_duration / audio_duration
+    return effective_speed > settings.max_playback_speed
+
+
 # ── Clip rendering ────────────────────────────────────────────────────
 
 
@@ -88,6 +107,9 @@ def _render_content_clip(
     video_duration = clip.source_end - clip.source_start
     audio_duration = clip.rendered_duration
 
+    max_speed = settings.max_playback_speed
+    min_speed = settings.min_playback_speed
+
     if audio_duration > 0 and video_duration > 0:
         effective_speed = video_duration / audio_duration
     else:
@@ -95,12 +117,13 @@ def _render_content_clip(
 
     # Handle extreme speeds
     filters = []
-    if effective_speed > _MAX_SPEED:
-        usable = audio_duration * _MAX_SPEED
+    if effective_speed > max_speed:
+        # Trim video to the usable portion (center crop in time)
+        usable = audio_duration * max_speed
         trim_start = clip.source_start + (video_duration - usable) / 2
         trim_duration = usable
-        effective_speed = _MAX_SPEED
-    elif effective_speed < _MIN_SPEED:
+        effective_speed = max_speed
+    elif effective_speed < min_speed:
         trim_start = clip.source_start
         trim_duration = video_duration
         adjusted = trim_duration / effective_speed
@@ -113,7 +136,10 @@ def _render_content_clip(
         trim_duration = video_duration
 
     filters.insert(0, f"setpts=PTS/{effective_speed:.4f}")
-    filters.append(f"fps={src_props['fps']:.2f}")
+
+    # Use output fps = source fps (capped at 60) to preserve smoothness
+    out_fps = min(src_props["fps"], 60.0)
+    filters.append(f"fps={out_fps:.2f}")
 
     cmd = [
         "ffmpeg", "-y",
@@ -154,7 +180,8 @@ def _render_freeze_clip(
 ) -> None:
     """Render a freeze clip: hold a keyframe still while voiceover audio plays.
 
-    Used when the LLM decides the viewer needs to read/absorb what's on screen.
+    Used when the LLM decides the viewer needs to read/absorb what's on screen,
+    OR when the speed would be too extreme for watchable playback (auto-freeze).
     Video = single frame from the segment's midpoint, looped for the sentence duration.
     Audio = trimmed from voiceover at the sentence's timestamps.
     """
@@ -199,18 +226,23 @@ def _render_gap_clip(
 
     During voiceover pauses, the viewer should see the screen recording
     continuing to play (not a frozen frame). Audio is silent.
+    Speed is clamped to safe bounds to avoid choppy playback.
     """
     gap_duration = clip.rendered_duration
     video_duration = clip.source_end - clip.source_start
 
+    max_speed = settings.max_playback_speed
+    min_speed = settings.min_playback_speed
+
     # Calculate speed to match gap duration
     if gap_duration > 0 and video_duration > 0:
         effective_speed = video_duration / gap_duration
-        effective_speed = max(0.1, min(5.0, effective_speed))
+        effective_speed = max(min_speed, min(max_speed, effective_speed))
     else:
         effective_speed = 1.0
 
-    video_filter = f"setpts=PTS/{effective_speed:.4f},fps={src_props['fps']:.2f}"
+    out_fps = min(src_props["fps"], 60.0)
+    video_filter = f"setpts=PTS/{effective_speed:.4f},fps={out_fps:.2f}"
 
     cmd = [
         "ffmpeg", "-y",
@@ -247,7 +279,7 @@ def _concatenate_simple(
     work_dir: Path,
     settings: Settings,
 ) -> None:
-    """Concatenate clips using concat demuxer."""
+    """Concatenate clips using concat demuxer with stream copy (no re-encode)."""
     concat_list = work_dir / "concat.txt"
     with open(concat_list, "w") as f:
         for cp in clip_paths:
@@ -258,12 +290,7 @@ def _concatenate_simple(
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_list),
-        "-c:v", settings.video_codec,
-        "-preset", settings.output_preset,
-        "-crf", str(settings.crf),
-        "-c:a", settings.audio_codec,
-        "-ar", "44100",
-        "-ac", "2",
+        "-c", "copy",  # stream copy — no re-encode since clips are already encoded
         str(output_path),
     ]
 

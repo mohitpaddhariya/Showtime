@@ -20,7 +20,7 @@ You just:
 
 Showtime then:
 - cuts out the boring and irrelevant parts of the recording,
-- syncs the voiceover precisely to what's happening on screen,
+- syncs the voiceover precisely to what's happening on screen (with adaptive playback speed so it's never too fast),
 - and gives you a tight, polished, easy-to-follow video — ready to share.
 
 No editing skills needed. No video team. No back-and-forth.

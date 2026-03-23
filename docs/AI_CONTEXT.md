@@ -54,7 +54,7 @@ Audio → Whisper (Groq) → Sentences          AI Mapper (Vision → Text → C
 3. **Scene-aware chronological** — maps by time scaling: `video_time = audio_time * (total_video / total_audio)`
 
 4. **Refinement loop** (max 2 passes):
-   - `_analyze_mapping()` builds pacing analysis with WARNING flags (speed >3x, <0.3x, long freeze >8s)
+   - `_analyze_mapping()` builds pacing analysis with WARNING flags (speed >2.0x, <0.5x, short clip <1.5s, long freeze >8s)
    - AI reviews its own mapping + warnings, responds `{"action": "keep"}` or `{"action": "refine", "mappings": [...]}`
    - Only accepted if warnings decrease
    - All passes enforce `_is_chronological()` — segment starts must be non-decreasing
@@ -68,9 +68,9 @@ Audio → Whisper (Groq) → Sentences          AI Mapper (Vision → Text → C
 ### Renderer (`app/services/renderer.py`)
 
 Three clip types:
-- **Content** (`_render_content_clip`): speed-adjusted video + trimmed audio. Speed clamped 0.5-3.0x
+- **Content** (`_render_content_clip`): speed-adjusted video + trimmed audio. Speed clamped 0.5-2.5x (auto-freezes if >2.5x)
 - **Freeze** (`_render_freeze_clip`): single keyframe looped + voiceover audio
-- **Gap** (`_render_gap_clip`): video at speed + generated silence (`anullsrc`)
+- **Gap** (`_render_gap_clip`): video at speed + generated silence (`anullsrc`), also respects speed clamps
 
 All clips: same fps, `-ar 44100 -ac 2`. Concatenated via concat demuxer. Output validated with ffprobe.
 
@@ -112,6 +112,8 @@ SHOWTIME_SCENE_THRESHOLD=30.0
 SHOWTIME_SCENE_REFINE_THRESHOLD=20.0
 SHOWTIME_MAX_SEGMENT_DURATION=10.0
 SHOWTIME_MIN_SEGMENT_DURATION=1.5
+SHOWTIME_MAX_PLAYBACK_SPEED=2.5
+SHOWTIME_MIN_PLAYBACK_SPEED=0.5
 ```
 
 ## What's Not Built Yet

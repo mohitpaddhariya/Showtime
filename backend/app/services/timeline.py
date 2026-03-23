@@ -100,6 +100,9 @@ def assemble_timeline(
     return Timeline(clips=clips, source_video=source_video, source_audio=source_audio)
 
 
+_MIN_CLIP_VIDEO_DURATION = 1.0  # seconds — clips shorter than this are unwatchable
+
+
 def _compute_video_positions(
     sorted_mappings: list[MappingEntry],
     segments_by_id: dict[int, CaptionedSegment],
@@ -107,57 +110,99 @@ def _compute_video_positions(
 ) -> dict[str, tuple[float, float]]:
     """Compute video start/end for each sentence AND gap.
 
-    Distributes the total usable video time proportionally across all
-    timeline events (sentences + gaps), so gaps get actual video content
-    instead of frozen frames.
+    RESPECTS the AI mapping: each sentence gets video from the segment
+    it was mapped to. When multiple sentences share a segment, the segment's
+    time range is split proportionally among them.
+
+    Enforces a minimum video duration per clip to prevent sub-second slices
+    that render as unwatchable blurs.
     """
-    # Collect all timeline events in order: sentences and gaps between them
-    events: list[tuple[str, float]] = []  # (key, duration)
+    if not sorted_mappings:
+        return {}
+
+    # ── Step 1: Group mappings by segment_id ─────────────────────────
+    # Track which sentences share each segment and their audio durations
+    seg_sentence_groups: dict[int, list[tuple[int, float]]] = defaultdict(list)
+    for mapping in sorted_mappings:
+        sentence = sentences_by_id.get(mapping.sentence_id)
+        if sentence is None:
+            continue
+        seg_sentence_groups[mapping.segment_id].append(
+            (mapping.sentence_id, sentence.duration)
+        )
+
+    # ── Step 2: Allocate sub-ranges within each segment ──────────────
+    # For each segment, divide its video time among the sentences mapped to it
+    # Enforces minimum video duration to prevent tiny unwatchable slices
+    sentence_video_ranges: dict[int, tuple[float, float]] = {}
+
+    for seg_id, sent_list in seg_sentence_groups.items():
+        segment = segments_by_id.get(seg_id)
+        if segment is None:
+            continue
+
+        seg_start = segment.start
+        seg_dur = segment.end - segment.start
+        total_audio = sum(dur for _, dur in sent_list)
+
+        if total_audio <= 0 or seg_dur <= 0:
+            # All sentences get the full segment range
+            for sent_id, _ in sent_list:
+                sentence_video_ranges[sent_id] = (seg_start, segment.end)
+            continue
+
+        # If segment is too short to split meaningfully, give each sentence
+        # the full segment range (renderer will handle via speed or freeze)
+        if len(sent_list) > 1 and seg_dur / len(sent_list) < _MIN_CLIP_VIDEO_DURATION:
+            for sent_id, _ in sent_list:
+                sentence_video_ranges[sent_id] = (seg_start, segment.end)
+            continue
+
+        # Distribute segment time proportionally by audio duration
+        cursor = seg_start
+        for sent_id, aud_dur in sent_list:
+            proportion = aud_dur / total_audio
+            slice_dur = seg_dur * proportion
+            # Enforce minimum duration per slice
+            slice_dur = max(slice_dur, min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
+            vid_start = cursor
+            vid_end = min(cursor + slice_dur, segment.end)
+            sentence_video_ranges[sent_id] = (round(vid_start, 3), round(vid_end, 3))
+            cursor = vid_end
+
+    # ── Step 3: Build positions dict (sentences + gaps) ──────────────
+    positions: dict[str, tuple[float, float]] = {}
 
     for i, mapping in enumerate(sorted_mappings):
         sentence = sentences_by_id.get(mapping.sentence_id)
         if sentence is None:
             continue
 
-        # Check for gap before this sentence
+        # Insert gap clip between sentences
         if i > 0:
-            prev_sentence = sentences_by_id[sorted_mappings[i - 1].sentence_id]
-            gap_duration = sentence.start - prev_sentence.end
-            if gap_duration >= _MIN_GAP_DURATION:
-                events.append((f"gap_{i}", gap_duration))
+            prev_sentence = sentences_by_id.get(sorted_mappings[i - 1].sentence_id)
+            if prev_sentence:
+                gap_duration = sentence.start - prev_sentence.end
+                if gap_duration >= _MIN_GAP_DURATION:
+                    # For gaps: use video between previous sentence's end and current sentence's start
+                    prev_vid_end = sentence_video_ranges.get(
+                        sorted_mappings[i - 1].sentence_id, (0.0, 0.0)
+                    )[1]
+                    curr_vid_start = sentence_video_ranges.get(
+                        mapping.sentence_id, (prev_vid_end, prev_vid_end)
+                    )[0]
 
-        events.append((f"sent_{mapping.sentence_id}", sentence.duration))
+                    # If there's video space between them, use it; otherwise hold the last position
+                    if curr_vid_start > prev_vid_end:
+                        positions[f"gap_{i}"] = (round(prev_vid_end, 3), round(curr_vid_start, 3))
+                    else:
+                        # No gap in video — hold the last frame position briefly
+                        positions[f"gap_{i}"] = (round(prev_vid_end, 3), round(prev_vid_end + 0.1, 3))
 
-    total_event_duration = sum(dur for _, dur in events)
-
-    # Get total usable video from the segments referenced by mappings
-    all_seg_ids = {m.segment_id for m in sorted_mappings}
-    all_segs = sorted([segments_by_id[sid] for sid in all_seg_ids if sid in segments_by_id],
-                      key=lambda s: s.start)
-
-    if not all_segs:
-        return {key: (0.0, 0.0) for key, _ in events}
-
-    video_start = all_segs[0].start
-    video_end = all_segs[-1].end
-    total_video = video_end - video_start
-
-    # Cap video to avoid using dead time beyond what makes sense
-    usable_video = min(total_video, total_event_duration * 1.2)
-
-    if total_event_duration <= 0:
-        return {key: (video_start, video_start) for key, _ in events}
-
-    # Distribute video proportionally across all events
-    positions: dict[str, tuple[float, float]] = {}
-    cursor = video_start
-
-    for key, duration in events:
-        proportion = duration / total_event_duration
-        slice_duration = usable_video * proportion
-        pos_start = cursor
-        pos_end = min(cursor + slice_duration, video_end)
-        positions[key] = (round(pos_start, 3), round(pos_end, 3))
-        cursor = pos_end
+        # Content clip: use the segment range assigned by AI mapping
+        vid_range = sentence_video_ranges.get(
+            mapping.sentence_id, (0.0, 0.0)
+        )
+        positions[f"sent_{mapping.sentence_id}"] = vid_range
 
     return positions

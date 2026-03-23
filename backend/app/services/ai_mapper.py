@@ -35,9 +35,13 @@ For each sentence, decide:
 1. Which screen segment it belongs to (match narration to visual content)
 2. Whether to FREEZE or PLAY the video during that sentence
 
+MATCHING STRATEGY:
+- Match by CONTENT FIRST: what the narrator says should match what's visible on screen.
+- Use TIMING as a secondary signal: sentences early in the voiceover likely map to early segments.
+- Consider segment DURATION: prefer segments long enough to comfortably play during the sentence.
+
 PLAY (default) = video plays normally. Use this for MOST sentences.
   The viewer sees the screen recording in motion — typing, scrolling, clicking, navigating.
-  This keeps the video dynamic and engaging.
 
 FREEZE (rare) = hold one frame still. ONLY use when ALL of these are true:
   - The screen shows a static result, table, or text block
@@ -46,7 +50,6 @@ FREEZE (rare) = hold one frame still. ONLY use when ALL of these are true:
   Use sparingly — maximum 2-3 freeze moments in a whole video.
 
 IMPORTANT: Default to PLAY. A video that's mostly frozen looks like a slideshow.
-Most demo recordings have continuous action that should be shown.
 
 RULES:
 - CHRONOLOGICAL ORDER: segment IDs must be non-decreasing (1,1,2,3 OK. 1,3,2 NOT OK).
@@ -231,12 +234,14 @@ def _analyze_mapping(
         line = f"Sen {m.sentence_id} → Seg {m.segment_id} [{mode}] | video={vid_dur:.1f}s audio={aud_dur:.1f}s speed={speed:.2f}x"
 
         # Flag pacing issues
-        if speed > 3.0:
-            line += " ⚠ WARNING: video way too long for this sentence (will play very fast)"
-        elif speed < 0.3:
+        if speed > 2.0:
+            line += " ⚠ WARNING: video way too long for this sentence (will play very fast, choppy)"
+        elif speed < 0.5:
             line += " ⚠ WARNING: video too short for this sentence (will play very slow/freeze)"
         elif m.freeze and aud_dur > 8.0:
             line += " ⚠ WARNING: long freeze (>8s) — viewer may get bored"
+        if vid_dur < 1.5 and not m.freeze:
+            line += " ⚠ WARNING: video clip too short (<1.5s) — consider mapping to a longer segment"
 
         lines.append(line)
 
@@ -249,8 +254,9 @@ REFINE_PROMPT = """You are reviewing your own video edit mapping. Here is what y
 
 ISSUES TO LOOK FOR:
 - Any WARNING lines need fixing
-- Sentences with speed > 3.0x will look too fast — try mapping them to a longer segment
-- Sentences with speed < 0.3x will look frozen — consider marking as freeze=true or remapping
+- Sentences with speed > 2.0x will look too fast and choppy — try mapping them to a longer segment
+- Sentences with speed < 0.5x will look frozen — consider marking as freeze=true or remapping
+- Video clips shorter than 1.5s will look bad — try mapping to a longer segment
 - Long freezes (>8s) bore the viewer — switch to PLAY or split across segments
 - If everything looks good, respond with: {{"action": "keep"}}
 
@@ -403,12 +409,16 @@ def _build_text_prompt(segments, sentences) -> str:
         for s in segments
     ]
     sentences_data = [
-        {"sentence_id": s.sentence_id, "text": s.text}
+        {"sentence_id": s.sentence_id, "text": s.text,
+         "start": round(s.start, 1), "end": round(s.end, 1),
+         "duration": round(s.duration, 1)}
         for s in sentences
     ]
     return (
-        f"Screen segments:\n{json.dumps(segments_data, indent=2)}\n\n"
-        f"Voiceover sentences:\n{json.dumps(sentences_data, indent=2)}"
+        f"Screen segments (with timestamps and descriptions):\n{json.dumps(segments_data, indent=2)}\n\n"
+        f"Voiceover sentences (with timestamps):\n{json.dumps(sentences_data, indent=2)}\n\n"
+        f"Match each sentence to the segment whose content best matches the narration. "
+        f"Use timestamps as a secondary signal — earlier sentences tend to map to earlier segments."
     )
 
 
