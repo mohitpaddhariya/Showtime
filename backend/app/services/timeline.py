@@ -4,12 +4,16 @@ Handles:
 - Ordering clips by voiceover sentence sequence
 - Smart sub-segment splitting when a segment is reused by multiple sentences
 - "Show" clips during voiceover silences (plays actual video, not frozen frame)
+- Audio-longer-than-video capping (drops sentences beyond video end)
 """
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from app.core.exceptions import TimelineError
 from app.models.domain import (
@@ -36,6 +40,10 @@ def assemble_timeline(
     When the voiceover has silent gaps between sentences, inserts "show" clips
     that play the actual video at 1x speed with silence — so the viewer can
     see what's on screen during the narrator's pause.
+
+    When the voiceover audio is longer than the source video, the video is
+    slowed down or frozen to wait for the audio, then resumes — no sentences
+    are dropped.
     """
     if not mappings:
         return Timeline(clips=[], source_video=source_video, source_audio=source_audio)
@@ -84,6 +92,15 @@ def assemble_timeline(
 
         # Content clip
         vid_start, vid_end = video_positions[f"sent_{mapping.sentence_id}"]
+
+        # Auto-freeze zero-duration clips (video exhausted for this segment)
+        force_freeze = vid_start >= vid_end and not mapping.freeze
+        if force_freeze:
+            logger.debug(
+                "Auto-freezing sentence %d (video exhausted at %.3fs)",
+                mapping.sentence_id, vid_start,
+            )
+
         clips.append(
             TimelineClip(
                 order=order,
@@ -92,7 +109,7 @@ def assemble_timeline(
                 speed_factor=mapping.speed_factor,
                 audio_start=sentence.start,
                 audio_end=sentence.end,
-                freeze=mapping.freeze,
+                freeze=mapping.freeze or force_freeze,
             )
         )
         order += 1
@@ -158,13 +175,24 @@ def _compute_video_positions(
                 sentence_video_ranges[sent_id] = (seg_start, segment.end)
             continue
 
+        # Check if proportional allocation with minimums would overflow.
+        # If so, skip the minimum enforcement and use pure proportional split.
+        # This makes each sentence advance sequentially through the segment
+        # at a consistent slow speed (e.g. 0.3x) — no restarts, no crazy speeds.
+        min_total = sum(
+            max(seg_dur * (dur / total_audio), min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
+            for _, dur in sent_list
+        )
+        use_minimums = min_total <= seg_dur * 1.05  # within 5% = safe to enforce mins
+
         # Distribute segment time proportionally by audio duration
         cursor = seg_start
         for sent_id, aud_dur in sent_list:
             proportion = aud_dur / total_audio
             slice_dur = seg_dur * proportion
-            # Enforce minimum duration per slice
-            slice_dur = max(slice_dur, min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
+            # Only enforce minimum when it won't cause overflow
+            if use_minimums:
+                slice_dur = max(slice_dur, min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
             vid_start = cursor
             vid_end = min(cursor + slice_dur, segment.end)
             sentence_video_ranges[sent_id] = (round(vid_start, 3), round(vid_end, 3))

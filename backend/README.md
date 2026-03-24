@@ -66,7 +66,8 @@ app/
 Screen Recording → Scene Detector → Keyframes ─┐
                    (auto-split + merge)         │
                                                 ├→ AI Mapper (Vision) → Timeline → Renderer → .mp4
-Voiceover Audio → Whisper (Groq) → Sentences ──┘   + Refinement Loop
+Voiceover Audio → Whisper (Groq) → Sentences ──┘   + Refinement Loop    (proportional split
+                                                                          + auto-freeze + gaps)
 ```
 
 **6 steps:**
@@ -80,7 +81,7 @@ Voiceover Audio → Whisper (Groq) → Sentences ──┘   + Refinement Loop
    - **Scene-aware chronological** — pure math fallback
    - **Refinement loop** (max 2 passes) — AI reviews its own mapping, sees pacing warnings, adjusts
    - All strategies enforce chronological order (no backward jumps)
-5. **Timeline** — Sub-segment splitting (enforces minimum video duration), gap clips with silence for natural pauses
+5. **Timeline** — Proportional sub-segment splitting (each sentence advances sequentially through its segment), auto-disables minimum-duration enforcement when audio > video to prevent cursor overflow, auto-freeze guard for zero-duration clips, gap clips with silence for natural pauses
 6. **Renderer** — Per-clip video+audio sync (play/gap), adaptive speed control, and **auto-freeze** for extreme speeds to maintain watchability, fps normalization, ffprobe validation
 
 ### Configuration

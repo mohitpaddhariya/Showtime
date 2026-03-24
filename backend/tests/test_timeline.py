@@ -199,6 +199,70 @@ class TestGapInsertion:
         assert tl.total_duration == pytest.approx(5.0)
 
 
+# ── Audio longer than video ───────────────────────────────────────────
+
+
+class TestAudioLongerThanVideo:
+    """Tests for audio >> video: video slows/freezes to match, no sentences dropped."""
+
+    def test_all_sentences_kept(self, segments):
+        """Audio 3x longer than video → all sentences preserved, none dropped."""
+        # Video: 3 segments, 0-15s total
+        # Audio: 10 sentences spanning 0-45s (3x longer)
+        long_sentences = [
+            VoiceoverSentence(sentence_id=i, text=f"Sentence {i}.", start=i * 4.5, end=(i + 1) * 4.5)
+            for i in range(1, 11)
+        ]
+        mappings = [
+            MappingEntry(sentence_id=s.sentence_id, segment_id=min(3, (s.sentence_id - 1) // 3 + 1))
+            for s in long_sentences
+        ]
+        tl = assemble_timeline(mappings, segments, long_sentences, VIDEO, AUDIO)
+        # All 10 sentences should produce clips (none dropped)
+        content_clips = [c for c in tl.clips if not c.is_gap]
+        assert len(content_clips) == 10
+
+    def test_no_zero_duration_play_clips(self, segments):
+        """Zero-duration clips should be auto-frozen, not left as PLAY."""
+        long_sentences = [
+            VoiceoverSentence(sentence_id=1, text="A.", start=0.0, end=5.0),
+            VoiceoverSentence(sentence_id=2, text="B.", start=5.0, end=10.0),
+            VoiceoverSentence(sentence_id=3, text="C.", start=14.0, end=15.0),
+            VoiceoverSentence(sentence_id=4, text="D.", start=16.0, end=20.0),
+            VoiceoverSentence(sentence_id=5, text="E.", start=20.0, end=25.0),
+        ]
+        mappings = [
+            MappingEntry(sentence_id=1, segment_id=1),
+            MappingEntry(sentence_id=2, segment_id=2),
+            MappingEntry(sentence_id=3, segment_id=3),
+            MappingEntry(sentence_id=4, segment_id=3),
+            MappingEntry(sentence_id=5, segment_id=3),
+        ]
+        tl = assemble_timeline(mappings, segments, long_sentences, VIDEO, AUDIO)
+        for clip in tl.clips:
+            if not clip.is_gap:
+                # Either has video duration, or is frozen
+                assert clip.source_end > clip.source_start or clip.freeze, (
+                    f"Zero-duration non-freeze clip: {clip.source_start}-{clip.source_end}"
+                )
+
+    def test_total_duration_covers_all_audio(self, segments):
+        """Output duration should cover all sentences, even beyond video end."""
+        sentences = [
+            VoiceoverSentence(sentence_id=1, text="A.", start=0.0, end=5.0),
+            VoiceoverSentence(sentence_id=2, text="B.", start=12.0, end=20.0),
+        ]
+        mappings = [
+            MappingEntry(sentence_id=1, segment_id=1),
+            MappingEntry(sentence_id=2, segment_id=3),
+        ]
+        tl = assemble_timeline(mappings, segments, sentences, VIDEO, AUDIO)
+        # Both sentences kept - total covers full audio range
+        content_clips = [c for c in tl.clips if not c.is_gap]
+        assert len(content_clips) == 2
+        assert tl.total_duration >= 12.0  # at least covers 0-5 + 12-20
+
+
 # ── Error handling ────────────────────────────────────────────────────
 
 

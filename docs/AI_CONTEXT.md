@@ -25,7 +25,7 @@ Audio → Whisper (Groq) → Sentences          AI Mapper (Vision → Text → C
                                                 ↓                    ↓
                                           Refinement Loop (max 2)   ↓
                                                 ↓                    ↓
-                                            Timeline (gaps + sub-segment split)
+                                            Timeline (proportional split + auto-freeze + gaps)
                                                 ↓
                                          Renderer (play/freeze/gap clips + concat)
                                                 ↓
@@ -62,7 +62,9 @@ Audio → Whisper (Groq) → Sentences          AI Mapper (Vision → Text → C
 ### Timeline (`app/services/timeline.py`)
 
 - `_compute_video_positions()` distributes video across ALL events (sentences + gaps)
-- **Sub-segment splitting**: shared segments split proportionally by audio duration
+- **Proportional sub-segment splitting**: shared segments split proportionally by audio duration, each sentence advances sequentially
+- **Audio > video guard**: when minimum-duration enforcement would overflow a segment (audio longer than video), automatically disables minimums — video plays through at consistent slow speed (~0.3x)
+- **Auto-freeze guard**: zero-duration clips (segment exhausted) auto-converted to freeze frames
 - **Gap clips**: silent pauses > 0.15s → video continues playing with silence
 
 ### Renderer (`app/services/renderer.py`)

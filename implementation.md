@@ -46,10 +46,11 @@ OCR / Frame Description                   |
       |                                   |
       v                                   v
       +----------→ AI Mapper ←------------+
-                  (Ollama/Llama 3)
+                  (Groq Vision/Text)
                       |
                       v
               Timeline Assembly
+          (proportional split + auto-freeze)
                       |
                       v
                 FFmpeg Render
@@ -140,7 +141,11 @@ OCR / Frame Description                   |
 - **Input:** AI mapping + original video + audio
 - **Process:**
   - Build edit decision list from mapping
-  - **Timeline:** Allocate video slices to sentences (enforcing a minimum video duration per clip)
+  - **Timeline:** Allocate video slices to sentences via proportional splitting:
+    - When multiple sentences share a segment, each gets a sequential slice (advancing forward)
+    - When audio is longer than video, minimum-duration enforcement is disabled to prevent cursor overflow — the video plays through at a consistent slow speed (~0.3x)
+    - Zero-duration clips are auto-converted to freeze frames
+  - **Gap clips:** Natural pauses in the voiceover (>0.15s) insert "show" clips where video continues in silence
   - **Renderer:** For each mapping entry:
     - Extract the screen segment and adjust playback speed to match voiceover duration
     - If speed exceeds max threshold (2.5x), **auto-freeze** on a keyframe to prevent choppy unwatchable playback
