@@ -1,1 +1,14 @@
-demo/*
+# OS
+.DS_Store
+
+# Demo assets (large media files)
+demo/
+
+# Python
+__pycache__/
+*.py[oc]
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/

@@ -49,3 +49,18 @@ class JobStatus(BaseModel):
     segments_detected: int | None = None
     sentences_detected: int | None = None
     clips_rendered: int | None = None
+    # Metadata
+    created_at: float | None = None
+    video_filename: str | None = None
+    audio_filename: str | None = None
+    preview_url: str | None = None
+
+
+class JobListResponse(BaseModel):
+    jobs: list[JobStatus]
+    total: int
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    detail: str | None = None

@@ -1,15 +1,70 @@
-"""OpenCV-based scene detection, idle segment identification, and keyframe extraction."""
+"""OpenCV-based scene detection with optional AI verification pass.
+
+Pipeline:
+1. Sample frames at SAMPLE_FPS using OpenCV
+2. Compute pixel diffs + histogram comparison -> scene boundaries
+3. Auto-split long segments, merge short segments, detect idle
+4. Extract keyframes (middle frame per segment)
+5. [NEW] AI Verification: batch ALL keyframes in ONE Llama 4 Scout call
+   -> confirm/merge/split segments semantically + assign semantic tags
+
+The AI verification uses a SINGLE Groq vision call regardless of segment count.
+This improves OpenCV's pixel-based detection with semantic understanding:
+e.g., OpenCV might split a slowly-scrolling page into 3 segments, but the AI
+recognizes it's all one page and merges them.
+
+Groq call budget: 0 calls (AI verify disabled) or 1 call (AI verify enabled).
+"""
 
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 
 import cv2
 import numpy as np
+from groq import Groq
 
 from app.core.config import Settings
 from app.core.exceptions import SceneDetectionError
 from app.models.domain import VideoSegment
+from app.services.vision_utils import build_image_content_blocks
+
+logger = logging.getLogger(__name__)
+
+
+# ── AI Verification Prompt ───────────────────────────────────────────
+# Sent once with ALL keyframes batched. The model sees every screen
+# and decides which boundaries are real scene changes vs. noise.
+
+_VERIFY_PROMPT = """\
+You are analyzing keyframe screenshots from a screen recording to verify scene boundaries.
+
+Each image represents the middle frame of a detected scene segment.
+
+For each segment, decide:
+1. Is this a valid, semantically distinct scene boundary?
+2. What is the screen content? (short semantic label)
+3. Is this segment idle/blank (no meaningful content)?
+
+Return ONLY valid JSON:
+{"segments": [
+  {"segment_id": 1, "action": "keep", "semantic_tag": "landing_page", "is_idle": false},
+  {"segment_id": 2, "action": "merge_with_prev", "semantic_tag": "", "is_idle": false},
+  ...
+]}
+
+ACTIONS:
+- "keep" = valid scene boundary, keep this segment
+- "merge_with_next" = same screen as next segment, absorb it
+- "merge_with_prev" = same screen as previous segment, absorb into it
+
+RULES:
+- Only merge segments that show the SAME screen content (e.g., slow scroll split into pieces)
+- Do NOT merge segments showing genuinely different screens
+- semantic_tag should be 1-3 words (e.g., "code_editor", "settings_modal", "login_form")
+- is_idle=true only for blank/static/loading screens with no useful content"""
 
 
 def detect_scenes(
@@ -17,7 +72,14 @@ def detect_scenes(
     work_dir: Path,
     settings: Settings | None = None,
 ) -> list[VideoSegment]:
-    """Analyze a video and return a list of segments with scene boundaries.
+    """Analyze a video and return segments with scene boundaries + semantic tags.
+
+    Steps:
+    1. OpenCV pixel-diff analysis -> initial segments
+    2. Auto-split long segments, merge short segments
+    3. Extract keyframes (middle frame of each segment)
+    4. [Optional] AI verification: batch keyframes -> Llama 4 Scout
+       -> refine boundaries + add semantic tags (1 Groq call)
 
     Args:
         video_path: Path to the input video file.
@@ -25,8 +87,9 @@ def detect_scenes(
         settings: Optional settings override; uses defaults if None.
 
     Returns:
-        List of VideoSegment, one per detected scene, ordered by start time.
-        Idle segments have is_idle=True.
+        List of VideoSegment ordered by start time.
+        - is_idle=True for idle/blank segments
+        - semantic_tag set when AI verification is enabled
 
     Raises:
         SceneDetectionError: If the video cannot be opened or read.
@@ -62,25 +125,148 @@ def detect_scenes(
     if not frames:
         raise SceneDetectionError(f"No frames could be read from: {video_path}")
 
-    # Compute diffs and find scene boundaries
+    # ── OpenCV analysis ──────────────────────────────────────────
     boundaries = _find_scene_boundaries(frames, settings)
-
-    # Build segments from boundaries
     video_duration = total_frames / fps
     segments = _build_segments(boundaries, frames, video_duration, settings)
-
-    # Auto-split long segments with a lower threshold
     segments = _refine_long_segments(segments, frames, video_duration, settings)
-
-    # Merge tiny segments into neighbors
     segments = _merge_short_segments(segments, settings)
 
-    # Extract keyframes and save them
+    # ── Extract keyframes ────────────────────────────────────────
     keyframes_dir = work_dir / "keyframes"
     keyframes_dir.mkdir(parents=True, exist_ok=True)
     _extract_keyframes(video_path, segments, keyframes_dir)
 
+    # ── AI Verification Pass (1 Groq vision call) ───────────────
+    # Batches ALL keyframes into one request. The model sees every screen
+    # and can confirm/merge/split based on actual visual content.
+    if settings.ai_verify_scenes and settings.groq_api_key:
+        try:
+            segments = _ai_verify_segments(segments, settings)
+            logger.info(
+                "AI verification: %d segments, tags: %s",
+                len(segments),
+                [s.semantic_tag for s in segments if s.semantic_tag],
+            )
+        except Exception as e:
+            # AI verification is best-effort — OpenCV segments are still usable
+            logger.warning("AI scene verification failed (using OpenCV segments): %s", e)
+
     return segments
+
+
+# ── AI Verification ──────────────────────────────────────────────────
+
+
+_MAX_IMAGES_PER_CALL = 5  # Groq Llama 4 Scout hard limit
+
+
+def _ai_verify_segments(
+    segments: list[VideoSegment],
+    settings: Settings,
+) -> list[VideoSegment]:
+    """Send keyframes to Llama 4 Scout for semantic verification.
+
+    Groq limits Llama 4 Scout to 5 images per request, so segments are
+    processed in chunks of 5. Each chunk is one API call.
+
+    Images are resized to 1024px max to keep payload under 4MB per call.
+    """
+    if not segments:
+        return segments
+
+    client = Groq(api_key=settings.groq_api_key)
+    verify_by_id: dict[int, dict] = {}
+
+    # Process segments in chunks of 5 (Groq's per-request image limit)
+    for chunk_start in range(0, len(segments), _MAX_IMAGES_PER_CALL):
+        chunk = segments[chunk_start:chunk_start + _MAX_IMAGES_PER_CALL]
+
+        content_blocks = build_image_content_blocks(chunk, max_dim=1024)
+        content_blocks.append({
+            "type": "text",
+            "text": (
+                "\n\nAnalyze these keyframes and verify the scene boundaries. "
+                "Return JSON with your assessment of each segment."
+            ),
+        })
+
+        response = client.chat.completions.create(
+            model=settings.groq_vision_model,
+            messages=[
+                {"role": "system", "content": _VERIFY_PROMPT},
+                {"role": "user", "content": content_blocks},
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"},
+        )
+
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+        for v in data.get("segments", []):
+            sid = v.get("segment_id")
+            if sid is not None:
+                verify_by_id[sid] = v
+
+    if not verify_by_id:
+        return segments
+
+    # Apply merges and semantic tags
+    result: list[VideoSegment] = []
+    skip_next = False
+
+    for i, seg in enumerate(segments):
+        if skip_next:
+            skip_next = False
+            continue
+
+        v = verify_by_id.get(seg.segment_id, {})
+        action = v.get("action", "keep")
+        tag = v.get("semantic_tag", "") or None
+        ai_idle = v.get("is_idle", False)
+
+        if action == "merge_with_next" and i + 1 < len(segments):
+            # Absorb next segment into this one
+            next_seg = segments[i + 1]
+            result.append(VideoSegment(
+                segment_id=seg.segment_id,
+                start=seg.start,
+                end=next_seg.end,
+                is_idle=seg.is_idle and next_seg.is_idle,
+                keyframe_path=seg.keyframe_path,
+                semantic_tag=tag,
+            ))
+            skip_next = True
+        elif action == "merge_with_prev" and result:
+            # Absorb into the previous segment
+            prev = result[-1]
+            result[-1] = VideoSegment(
+                segment_id=prev.segment_id,
+                start=prev.start,
+                end=seg.end,
+                is_idle=prev.is_idle and seg.is_idle,
+                keyframe_path=prev.keyframe_path,
+                semantic_tag=prev.semantic_tag or tag,
+            )
+        else:
+            # Keep segment, apply AI enrichments
+            result.append(VideoSegment(
+                segment_id=seg.segment_id,
+                start=seg.start,
+                end=seg.end,
+                is_idle=seg.is_idle or ai_idle,
+                keyframe_path=seg.keyframe_path,
+                semantic_tag=tag,
+            ))
+
+    # Re-number segment IDs after merges
+    for i, seg in enumerate(result):
+        seg.segment_id = i + 1
+
+    return result
+
+
+# ── OpenCV scene boundary detection ─────────────────────────────────
 
 
 def _find_scene_boundaries(

@@ -31,6 +31,7 @@ async def upload_files(
     video_path, audio_path, work_dir = await _save_uploads(video, audio)
     output_path = work_dir / "output.mp4"
     job = job_store.create(video_path, audio_path, output_path, work_dir)
+    job_store.update(job.job_id, video_filename=video.filename, audio_filename=audio.filename)
 
     return UploadResponse(
         job_id=job.job_id,
@@ -47,6 +48,7 @@ async def upload_and_process(
     video_path, audio_path, work_dir = await _save_uploads(video, audio)
     output_path = work_dir / "output.mp4"
     job = job_store.create(video_path, audio_path, output_path, work_dir)
+    job_store.update(job.job_id, video_filename=video.filename, audio_filename=audio.filename)
 
     # Start processing immediately
     job_store.update(job.job_id, status="processing", progress=0, step="Starting")

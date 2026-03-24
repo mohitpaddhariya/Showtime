@@ -20,6 +20,10 @@ class VideoSegment(BaseModel):
     keyframe_path: Path | None = Field(
         default=None, description="Path to the extracted keyframe PNG"
     )
+    semantic_tag: str | None = Field(
+        default=None,
+        description="AI-generated semantic label (e.g. 'landing_page', 'settings_modal')",
+    )
 
     @property
     def duration(self) -> float:
@@ -77,6 +81,16 @@ class MappingEntry(BaseModel):
     freeze: bool = Field(
         default=False,
         description="If true, hold the keyframe still while audio plays (for reading/emphasis)",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="AI confidence in this mapping (0.0-1.0)",
+    )
+    reasoning: str = Field(
+        default="",
+        description="AI reasoning for this mapping decision",
     )
 
 

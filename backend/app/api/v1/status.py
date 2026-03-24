@@ -25,14 +25,22 @@ async def get_status(job_id: str):
         progress=job.progress,
         step=job.step,
         error=job.error,
+        created_at=job.created_at,
+        video_filename=job.video_filename,
+        audio_filename=job.audio_filename,
     )
 
     # Include result metadata when completed
     if job.status == "completed" and job.result:
         response.download_url = f"/api/v1/download/{job_id}"
+        response.preview_url = f"/api/v1/preview/{job_id}"
         response.duration = job.result.duration
         response.segments_detected = job.result.segments_detected
         response.sentences_detected = job.result.sentences_detected
         response.clips_rendered = job.result.clips_rendered
+
+    # Preview available as soon as video is uploaded
+    if job.video_path and job.video_path.exists():
+        response.preview_url = f"/api/v1/preview/{job_id}"
 
     return response

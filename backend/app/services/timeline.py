@@ -2,9 +2,11 @@
 
 Handles:
 - Ordering clips by voiceover sentence sequence
-- Smart sub-segment splitting when a segment is reused by multiple sentences
-- "Show" clips during voiceover silences (plays actual video, not frozen frame)
-- Audio-longer-than-video capping (drops sentences beyond video end)
+- Constrained video allocation: proportional splitting with minimum enforcement
+  and speed-deviation minimization across shared segments
+- "Show" clips during voiceover silences (plays actual video, not frozen)
+- Audio-longer-than-video guard (slows/freezes, never drops sentences)
+- Auto-freeze guard for zero-duration clips (segment exhausted)
 """
 
 from __future__ import annotations
@@ -27,6 +29,9 @@ from app.models.domain import (
 # Minimum gap between sentences to insert a show/silence clip (seconds)
 _MIN_GAP_DURATION = 0.15
 
+# Minimum video slice per clip — clips shorter than this are unwatchable
+_MIN_CLIP_VIDEO_DURATION = 1.0
+
 
 def assemble_timeline(
     mappings: list[MappingEntry],
@@ -37,13 +42,12 @@ def assemble_timeline(
 ) -> Timeline:
     """Build an edit decision list from the AI mapping.
 
-    When the voiceover has silent gaps between sentences, inserts "show" clips
-    that play the actual video at 1x speed with silence — so the viewer can
-    see what's on screen during the narrator's pause.
+    For silent gaps between sentences, inserts "show" clips that play
+    the actual video at 1x speed with silence — the viewer sees what's
+    on screen during the narrator's pause.
 
-    When the voiceover audio is longer than the source video, the video is
-    slowed down or frozen to wait for the audio, then resumes — no sentences
-    are dropped.
+    When voiceover audio is longer than source video, the video is
+    slowed down or frozen — no sentences are dropped.
     """
     if not mappings:
         return Timeline(clips=[], source_video=source_video, source_audio=source_audio)
@@ -53,8 +57,8 @@ def assemble_timeline(
 
     sorted_mappings = sorted(mappings, key=lambda m: m.sentence_id)
 
-    # Compute the video cursor positions for each sentence + gap
-    # The video is distributed across ALL time (sentences + gaps), not just sentences
+    # Compute video cursor positions for each sentence + gap using
+    # constrained proportional allocation within each shared segment
     video_positions = _compute_video_positions(sorted_mappings, segments_by_id, sentences_by_id)
 
     clips: list[TimelineClip] = []
@@ -69,13 +73,12 @@ def assemble_timeline(
         if sentence is None:
             raise TimelineError(f"Mapping references nonexistent sentence_id {mapping.sentence_id}")
 
-        # Insert a "show" clip if there's a gap before this sentence
+        # Insert a "show" clip for voiceover gaps (natural pauses)
         if i > 0:
             prev_sentence = sentences_by_id.get(sorted_mappings[i - 1].sentence_id)
             if prev_sentence:
                 gap_duration = sentence.start - prev_sentence.end
                 if gap_duration >= _MIN_GAP_DURATION:
-                    # Play actual video during the gap (not a frozen frame)
                     gap_vid_start, gap_vid_end = video_positions[f"gap_{i}"]
                     clips.append(
                         TimelineClip(
@@ -93,7 +96,7 @@ def assemble_timeline(
         # Content clip
         vid_start, vid_end = video_positions[f"sent_{mapping.sentence_id}"]
 
-        # Auto-freeze zero-duration clips (video exhausted for this segment)
+        # Auto-freeze zero-duration clips (segment video fully consumed)
         force_freeze = vid_start >= vid_end and not mapping.freeze
         if force_freeze:
             logger.debug(
@@ -117,9 +120,6 @@ def assemble_timeline(
     return Timeline(clips=clips, source_video=source_video, source_audio=source_audio)
 
 
-_MIN_CLIP_VIDEO_DURATION = 1.0  # seconds — clips shorter than this are unwatchable
-
-
 def _compute_video_positions(
     sorted_mappings: list[MappingEntry],
     segments_by_id: dict[int, CaptionedSegment],
@@ -127,18 +127,20 @@ def _compute_video_positions(
 ) -> dict[str, tuple[float, float]]:
     """Compute video start/end for each sentence AND gap.
 
-    RESPECTS the AI mapping: each sentence gets video from the segment
-    it was mapped to. When multiple sentences share a segment, the segment's
-    time range is split proportionally among them.
+    Uses constrained proportional allocation:
+    1. Group sentences by their mapped segment
+    2. For each segment, split video time proportionally by audio duration
+    3. Enforce minimum clip duration (when feasible without overflow)
+    4. Redistribute to minimize speed deviation from ideal (seg_dur / total_audio)
 
-    Enforces a minimum video duration per clip to prevent sub-second slices
-    that render as unwatchable blurs.
+    When minimum-duration enforcement would overflow a segment (audio >> video),
+    automatically disables minimums. The video plays through at a consistent
+    slow speed rather than restarting or freezing randomly.
     """
     if not sorted_mappings:
         return {}
 
     # ── Step 1: Group mappings by segment_id ─────────────────────────
-    # Track which sentences share each segment and their audio durations
     seg_sentence_groups: dict[int, list[tuple[int, float]]] = defaultdict(list)
     for mapping in sorted_mappings:
         sentence = sentences_by_id.get(mapping.sentence_id)
@@ -149,8 +151,6 @@ def _compute_video_positions(
         )
 
     # ── Step 2: Allocate sub-ranges within each segment ──────────────
-    # For each segment, divide its video time among the sentences mapped to it
-    # Enforces minimum video duration to prevent tiny unwatchable slices
     sentence_video_ranges: dict[int, tuple[float, float]] = {}
 
     for seg_id, sent_list in seg_sentence_groups.items():
@@ -163,38 +163,46 @@ def _compute_video_positions(
         total_audio = sum(dur for _, dur in sent_list)
 
         if total_audio <= 0 or seg_dur <= 0:
-            # All sentences get the full segment range
             for sent_id, _ in sent_list:
                 sentence_video_ranges[sent_id] = (seg_start, segment.end)
             continue
 
         # If segment is too short to split meaningfully, give each sentence
-        # the full segment range (renderer will handle via speed or freeze)
+        # the full range (renderer handles via speed or freeze)
         if len(sent_list) > 1 and seg_dur / len(sent_list) < _MIN_CLIP_VIDEO_DURATION:
             for sent_id, _ in sent_list:
                 sentence_video_ranges[sent_id] = (seg_start, segment.end)
             continue
 
-        # Check if proportional allocation with minimums would overflow.
-        # If so, skip the minimum enforcement and use pure proportional split.
-        # This makes each sentence advance sequentially through the segment
-        # at a consistent slow speed (e.g. 0.3x) — no restarts, no crazy speeds.
+        # Check if proportional allocation with minimums would overflow
         min_total = sum(
             max(seg_dur * (dur / total_audio), min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
             for _, dur in sent_list
         )
-        use_minimums = min_total <= seg_dur * 1.05  # within 5% = safe to enforce mins
+        use_minimums = min_total <= seg_dur * 1.05  # within 5% tolerance
 
-        # Distribute segment time proportionally by audio duration
-        cursor = seg_start
-        for sent_id, aud_dur in sent_list:
+        # Proportional allocation: each sentence gets video proportional
+        # to its audio duration. This gives uniform speed across all clips
+        # sharing the segment: speed = seg_dur / total_audio.
+        allocations = []
+        for _, aud_dur in sent_list:
             proportion = aud_dur / total_audio
             slice_dur = seg_dur * proportion
-            # Only enforce minimum when it won't cause overflow
             if use_minimums:
                 slice_dur = max(slice_dur, min(_MIN_CLIP_VIDEO_DURATION, seg_dur))
+            allocations.append(slice_dur)
+
+        # Normalize if allocations exceed segment duration (from minimum enforcement)
+        alloc_total = sum(allocations)
+        if alloc_total > seg_dur * 1.001:  # >0.1% over
+            scale = seg_dur / alloc_total
+            allocations = [a * scale for a in allocations]
+
+        # Assign sequential video ranges within the segment
+        cursor = seg_start
+        for idx, (sent_id, _) in enumerate(sent_list):
             vid_start = cursor
-            vid_end = min(cursor + slice_dur, segment.end)
+            vid_end = min(cursor + allocations[idx], segment.end)
             sentence_video_ranges[sent_id] = (round(vid_start, 3), round(vid_end, 3))
             cursor = vid_end
 
@@ -212,7 +220,6 @@ def _compute_video_positions(
             if prev_sentence:
                 gap_duration = sentence.start - prev_sentence.end
                 if gap_duration >= _MIN_GAP_DURATION:
-                    # For gaps: use video between previous sentence's end and current sentence's start
                     prev_vid_end = sentence_video_ranges.get(
                         sorted_mappings[i - 1].sentence_id, (0.0, 0.0)
                     )[1]
@@ -220,14 +227,13 @@ def _compute_video_positions(
                         mapping.sentence_id, (prev_vid_end, prev_vid_end)
                     )[0]
 
-                    # If there's video space between them, use it; otherwise hold the last position
                     if curr_vid_start > prev_vid_end:
                         positions[f"gap_{i}"] = (round(prev_vid_end, 3), round(curr_vid_start, 3))
                     else:
                         # No gap in video — hold the last frame position briefly
                         positions[f"gap_{i}"] = (round(prev_vid_end, 3), round(prev_vid_end + 0.1, 3))
 
-        # Content clip: use the segment range assigned by AI mapping
+        # Content clip
         vid_range = sentence_video_ranges.get(
             mapping.sentence_id, (0.0, 0.0)
         )

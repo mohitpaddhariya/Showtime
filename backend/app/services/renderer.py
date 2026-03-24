@@ -1,10 +1,18 @@
 """FFmpeg-based video rendering from a Timeline.
 
 Per-clip approach:
-1. For each clip: trim video (speed-adjusted) + trim matching audio → muxed clip
-2. Concatenate all clips (with optional crossfade) → final output
+1. For each clip: trim video (speed-adjusted) + trim matching audio -> muxed clip
+2. Concatenate all clips (stream copy, no re-encode) -> final output
 
-Each clip is a self-contained video+audio file, so concatenation always preserves audio.
+Clip types:
+- Content: speed-adjusted video + voiceover audio (speed clamped 0.5-2.5x)
+- Freeze: single keyframe with Ken Burns effect (subtle zoom) + voiceover audio
+- Gap: video at speed + generated silence (during narrator pauses)
+
+Ken Burns effect on freeze clips (NEW):
+When a clip is frozen (static keyframe), applying a very subtle slow zoom
+(1.0x -> 1.03x over the clip duration) prevents the "dead screen" effect
+and keeps the viewer engaged. This is configurable via settings.
 """
 
 from __future__ import annotations
@@ -36,7 +44,8 @@ def render(
 ) -> Path:
     """Render the timeline to a final video file with synced audio.
 
-    Each clip is rendered with its own video+audio, then all clips are concatenated.
+    Each clip is rendered individually with its own video+audio, then all
+    clips are concatenated via concat demuxer (stream copy, no re-encode).
     """
     if settings is None:
         settings = Settings()
@@ -65,7 +74,7 @@ def render(
             clip_paths.append(clip_path)
             clip_durations.append(clip.rendered_duration)
 
-        # Pass 2: Concatenate
+        # Pass 2: Concatenate (stream copy — no re-encode)
         if len(clip_paths) == 1:
             _copy_file(clip_paths[0], output_path)
         else:
@@ -82,8 +91,7 @@ def _should_auto_freeze(clip: TimelineClip, settings: Settings) -> bool:
     """Auto-freeze clips that would need extreme speed-up.
 
     When video-to-audio ratio exceeds the max speed threshold, the result
-    is unwatchably choppy. Better to hold a keyframe still (freeze) so the
-    viewer can read the screen while listening.
+    is unwatchably choppy. Hold a keyframe still instead.
     """
     video_duration = clip.source_end - clip.source_start
     audio_duration = clip.rendered_duration
@@ -103,7 +111,12 @@ def _render_content_clip(
     src_props: dict,
     settings: Settings,
 ) -> None:
-    """Render one clip: speed-adjusted video + trimmed audio, muxed together."""
+    """Render one clip: speed-adjusted video + trimmed audio, muxed together.
+
+    Speed is clamped to [min_playback_speed, max_playback_speed].
+    If speed exceeds max, the video is center-cropped in time to fit.
+    If speed is below min, padding is added to fill the gap.
+    """
     video_duration = clip.source_end - clip.source_start
     audio_duration = clip.rendered_duration
 
@@ -118,12 +131,13 @@ def _render_content_clip(
     # Handle extreme speeds
     filters = []
     if effective_speed > max_speed:
-        # Trim video to the usable portion (center crop in time)
+        # Too fast — center-crop the video in time to reduce speed
         usable = audio_duration * max_speed
         trim_start = clip.source_start + (video_duration - usable) / 2
         trim_duration = usable
         effective_speed = max_speed
     elif effective_speed < min_speed:
+        # Too slow — play what we have, pad the rest with frame cloning
         trim_start = clip.source_start
         trim_duration = video_duration
         adjusted = trim_duration / effective_speed
@@ -137,7 +151,7 @@ def _render_content_clip(
 
     filters.insert(0, f"setpts=PTS/{effective_speed:.4f}")
 
-    # Use output fps = source fps (capped at 60) to preserve smoothness
+    # Preserve source fps (capped at 60) for smoothness
     out_fps = min(src_props["fps"], 60.0)
     filters.append(f"fps={out_fps:.2f}")
 
@@ -151,7 +165,7 @@ def _render_content_clip(
         "-ss", f"{clip.audio_start:.3f}",
         "-t", f"{audio_duration:.3f}",
         "-i", str(timeline.source_audio),
-        # Video filter
+        # Video filter chain
         "-filter:v", ",".join(filters),
         # Map video from input 0, audio from input 1
         "-map", "0:v:0",
@@ -178,28 +192,51 @@ def _render_freeze_clip(
     src_props: dict,
     settings: Settings,
 ) -> None:
-    """Render a freeze clip: hold a keyframe still while voiceover audio plays.
+    """Render a freeze clip with optional Ken Burns effect.
 
-    Used when the LLM decides the viewer needs to read/absorb what's on screen,
-    OR when the speed would be too extreme for watchable playback (auto-freeze).
-    Video = single frame from the segment's midpoint, looped for the sentence duration.
+    Without Ken Burns: single frame looped for the clip duration (static).
+    With Ken Burns: subtle slow zoom from 1.0x to ~1.03x, centered, which
+    prevents the "dead screen" effect and keeps viewers engaged.
+
+    Video = single frame from segment midpoint, zoomed/looped for duration.
     Audio = trimmed from voiceover at the sentence's timestamps.
     """
     audio_duration = clip.rendered_duration
-    freeze_time = (clip.source_start + clip.source_end) / 2  # midpoint of segment
+    freeze_time = (clip.source_start + clip.source_end) / 2
     fps = src_props["fps"]
+    width = src_props["width"]
+    height = src_props["height"]
+
+    # Build video filter chain
+    use_ken_burns = settings.ken_burns_on_freeze and audio_duration > 0.5
+    if use_ken_burns:
+        # Ken Burns: subtle slow zoom centered on the frame
+        # zoompan reads one frame and produces a zoom animation
+        total_frames = max(int(audio_duration * fps), 1)
+        max_zoom = settings.ken_burns_zoom
+        # Calculate per-frame zoom increment to reach max_zoom over the clip
+        zoom_step = (max_zoom - 1.0) / max(total_frames, 1)
+        video_filter = (
+            f"zoompan=z='min(zoom+{zoom_step:.6f},{max_zoom:.4f})"
+            f"':d={total_frames}"
+            f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+            f":s={width}x{height}:fps={fps:.2f}"
+        )
+    else:
+        # Simple frame loop (no Ken Burns)
+        video_filter = f"loop=loop=-1:size=1:start=0,fps={fps:.2f},setpts=N/FR/TB"
 
     cmd = [
         "ffmpeg", "-y",
-        # Video: grab one frame and loop it
+        # Video: grab one frame
         "-ss", f"{freeze_time:.3f}",
         "-i", str(timeline.source_video),
         # Audio: trim voiceover for this sentence
         "-ss", f"{clip.audio_start:.3f}",
         "-t", f"{audio_duration:.3f}",
         "-i", str(timeline.source_audio),
-        # Video filter: loop single frame for exact duration
-        "-filter:v", f"loop=loop=-1:size=1:start=0,fps={fps:.2f},setpts=N/FR/TB",
+        # Video filter
+        "-filter:v", video_filter,
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-t", f"{audio_duration:.3f}",
@@ -222,11 +259,11 @@ def _render_gap_clip(
     src_props: dict,
     settings: Settings,
 ) -> None:
-    """Render a 'show' clip: actual video playing at speed + silence.
+    """Render a gap clip: video + silence during voiceover pauses.
 
-    During voiceover pauses, the viewer should see the screen recording
-    continuing to play (not a frozen frame). Audio is silent.
-    Speed is clamped to safe bounds to avoid choppy playback.
+    When there's enough video for smooth playback, plays video at speed.
+    When video is too short (speed < min), holds a clean still frame
+    instead of playing extreme slow-motion that looks laggy/glitchy.
     """
     gap_duration = clip.rendered_duration
     video_duration = clip.source_end - clip.source_start
@@ -234,23 +271,50 @@ def _render_gap_clip(
     max_speed = settings.max_playback_speed
     min_speed = settings.min_playback_speed
 
-    # Calculate speed to match gap duration
     if gap_duration > 0 and video_duration > 0:
-        effective_speed = video_duration / gap_duration
-        effective_speed = max(min_speed, min(max_speed, effective_speed))
+        raw_speed = video_duration / gap_duration
     else:
-        effective_speed = 1.0
+        raw_speed = 0.0
 
+    # When video is too short for smooth playback (e.g., 0.1s video over
+    # 0.7s gap = 0.14x speed), hold a clean still frame + silence.
+    # This prevents the "laggy" feel during natural speech pauses.
+    if raw_speed < min_speed:
+        freeze_time = clip.source_start
+        fps = src_props["fps"]
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{freeze_time:.3f}",
+            "-i", str(timeline.source_video),
+            "-f", "lavfi",
+            "-t", f"{gap_duration:.3f}",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-filter:v", f"loop=loop=-1:size=1:start=0,fps={fps:.2f},setpts=N/FR/TB",
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-t", f"{gap_duration:.3f}",
+            "-c:v", settings.video_codec,
+            "-preset", settings.output_preset,
+            "-crf", str(settings.crf),
+            "-c:a", settings.audio_codec,
+            "-ar", "44100",
+            "-ac", "2",
+            str(output_path),
+        ]
+        _run_ffmpeg(cmd, f"gap-freeze clip {clip.order}")
+        return
+
+    # Normal gap: enough video for smooth playback at clamped speed
+    effective_speed = max(min_speed, min(max_speed, raw_speed))
     out_fps = min(src_props["fps"], 60.0)
     video_filter = f"setpts=PTS/{effective_speed:.4f},fps={out_fps:.2f}"
 
     cmd = [
         "ffmpeg", "-y",
-        # Video: actual recording, speed-adjusted
         "-ss", f"{clip.source_start:.3f}",
         "-t", f"{video_duration:.3f}",
         "-i", str(timeline.source_video),
-        # Audio: silence
         "-f", "lavfi",
         "-t", f"{gap_duration:.3f}",
         "-i", "anullsrc=r=44100:cl=stereo",
@@ -306,6 +370,7 @@ def _copy_file(src: Path, dst: Path) -> None:
 
 
 def _probe_video(video_path: Path) -> dict:
+    """Extract video properties (fps, width, height) via ffprobe."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "quiet", "-print_format", "json",
@@ -330,6 +395,7 @@ def _probe_video(video_path: Path) -> dict:
 
 
 def _validate_output(output_path: Path) -> None:
+    """Validate the rendered output has both video and audio streams."""
     try:
         result = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -354,6 +420,7 @@ def _validate_output(output_path: Path) -> None:
 
 
 def _run_ffmpeg(cmd: list[str], description: str) -> None:
+    """Execute an FFmpeg command with error handling."""
     logger.debug("FFmpeg [%s]: %s", description, " ".join(cmd))
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)

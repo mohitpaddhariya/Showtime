@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"
     ollama_base_url: str = "http://localhost:11434"
 
+    # AI scene verification (1 Groq vision call to confirm/merge/split OpenCV segments)
+    ai_verify_scenes: bool = True  # set False to skip AI verification and save 1 API call
+
+    # Mapping tuning
+    max_freeze_count: int = 3  # max freeze frames per video (prevents slideshow)
+    pacing_threshold: float = 8.5  # AI self-score below this triggers 1 refinement call (0-10)
+
     # Renderer
     video_codec: str = "libx264"
     audio_codec: str = "aac"
@@ -38,5 +45,7 @@ class Settings(BaseSettings):
     crossfade_duration: float = 0.3  # seconds of crossfade between clips (0 = hard cut)
     max_playback_speed: float = 2.5  # max speed before auto-freeze (>2.5x looks choppy)
     min_playback_speed: float = 0.5  # min speed before auto-freeze (<0.5x looks frozen)
+    ken_burns_on_freeze: bool = True  # subtle zoom/pan on freeze clips (prevents dead screen)
+    ken_burns_zoom: float = 1.03  # max zoom factor for Ken Burns (1.03 = 3% zoom, very subtle)
 
     model_config = {"env_prefix": "SHOWTIME_", "env_file": ".env", "env_file_encoding": "utf-8"}
