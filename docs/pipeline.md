@@ -4,7 +4,7 @@ Showtime's core objective is to take a raw, unedited screen recording and a sepa
 
 Here is a step-by-step breakdown of exactly how the pipeline works:
 
-![Pipeline Overview](docs/diagrams/01_pipeline_overview.png)
+![Pipeline Overview](./diagrams/01_pipeline_overview.png)
 
 ---
 
@@ -47,7 +47,7 @@ Here is a step-by-step breakdown of exactly how the pipeline works:
 
 **Groq call budget: 1 vision call + 0-1 refinement = 1-2 calls (down from up to 5 in v1).**
 
-![Mapping Refinement Loop](docs/diagrams/02_mapping_refinement.png)
+![Mapping Refinement Loop](./diagrams/02_mapping_refinement.png)
 
 ### 5. Timeline Assembly (`timeline.py`)
 **Goal:** Translate the AI's logical mapping into a frame-accurate Edit Decision List (EDL).
@@ -67,4 +67,4 @@ Here is a step-by-step breakdown of exactly how the pipeline works:
 - **[v2] Gap-Freeze:** Gap clips where the video is too short for smooth playback (speed < 0.5x) now hold a clean still frame + silence, instead of playing extreme slow-motion that looks laggy.
 - All individual clips are seamlessly concatenated together into the final `.mp4` output.
 
-![Renderer Clip Types](docs/diagrams/03_renderer_clips.png)
+![Renderer Clip Types](./diagrams/03_renderer_clips.png)
